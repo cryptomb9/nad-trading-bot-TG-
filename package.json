@@ -1,0 +1,24 @@
+{
+  "name": "nad-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.2.2",
+    "ethers": "^6.15.0",
+    "fs": "^0.0.1-security",
+    "node-fetch": "^2.7.0",
+    "sqlite3": "^5.1.7",
+    "telegraf": "^4.16.3"
+  }
+}
