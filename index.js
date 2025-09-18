@@ -207,15 +207,19 @@ async function executeSell(ctx, positionIndex, percentage) {
     ]);
 
     const { balance, decimals } = balanceData;
-    const sellAmount = (BigInt(balance) * BigInt(percentage)) / 100n;
+    const sellAmount = (BigInt(balance) * BigInt(percentage)) / BigInt(100);
     
     if (sellAmount === 0n) {
+      // Remove empty position
+      user.positions.splice(positionIndex, 1);
+      dbSaveWallet(String(ctx.from.id), user);
+      
       return ctx.telegram.editMessageText(
         ctx.chat.id,
         statusMsg.message_id,
         undefined,
-        "❌ No tokens to sell",
-        Markup.inlineKeyboard([[Markup.button.callback("« Back", "positions")]])
+        "❌ No tokens to sell - position removed",
+        Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions")]])
       );
     }
 
@@ -228,17 +232,24 @@ async function executeSell(ctx, positionIndex, percentage) {
 
     const token = new ethers.Contract(pos.ca, erc20Abi, wallet);
     const deadline = Math.floor(Date.now() / 1000) + 1800;
-    const routerAddress = marketData.market_type === "CURVE" ? CONTRACTS.BONDING_CURVE_ROUTER : CONTRACTS.DEX_ROUTER;
-    
-    const approveTx = await token.approve(routerAddress, sellAmount);
-    await approveTx.wait();
-    
+    let routerAddress;
     let tx;
+    
     if (marketData.market_type === "DEX") {
-      const dexRouterRead = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, provider);
-      const quoteData = await dexRouterRead.getAmountOut(pos.ca, sellAmount, false);
-      const minOut = (quoteData * BigInt(100 - user.slippage)) / 100n;
+      routerAddress = CONTRACTS.DEX_ROUTER;
       
+      // Approve tokens for DEX router
+      const approveTx = await token.approve(routerAddress, sellAmount);
+      await approveTx.wait();
+      
+      // FIXED: Use wallet for both read and write operations
+      const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
+      
+      // Get quote using wallet-connected contract
+      const quoteData = await dexRouterWithWallet.getAmountOut(pos.ca, sellAmount, false);
+      const minOut = (quoteData * (100n - BigInt(user.slippage))) / 100n;
+
+
       const sellParams = {
         amountIn: sellAmount,
         amountOutMin: minOut,
@@ -247,12 +258,19 @@ async function executeSell(ctx, positionIndex, percentage) {
         deadline: deadline
       };
 
-      const dexRouterWrite = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
-      tx = await dexRouterWrite.sell(sellParams);
+      // Execute sell
+      tx = await dexRouterWithWallet.sell(sellParams);
+      
     } else if (marketData.market_type === "CURVE") {
+      routerAddress = CONTRACTS.BONDING_CURVE_ROUTER;
+      
+      // Approve tokens for bonding curve router
+      const approveTx = await token.approve(routerAddress, sellAmount);
+      await approveTx.wait();
+      
       const sellParams = {
         amountIn: sellAmount,
-        amountOutMin: 0,
+        amountOutMin: 0, // Could add slippage protection here too
         token: pos.ca,
         to: user.address,
         deadline: deadline
@@ -260,6 +278,15 @@ async function executeSell(ctx, positionIndex, percentage) {
 
       const bondingCurveWrite = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, wallet);
       tx = await bondingCurveWrite.sell(sellParams);
+      
+    } else {
+      return ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        undefined,
+        `❌ Unsupported market type: ${marketData.market_type}`,
+        Markup.inlineKeyboard([[Markup.button.callback("« Back", "positions")]])
+      );
     }
 
     await ctx.telegram.editMessageText(
@@ -269,7 +296,20 @@ async function executeSell(ctx, positionIndex, percentage) {
       `⏳ Sell submitted! Hash: ${tx.hash.substring(0, 20)}...`
     );
 
-    tx.wait().then(() => {
+    // Handle transaction confirmation
+    tx.wait().then(async () => {
+      // Update position after successful sell
+      if (percentage === 100) {
+        // Remove position if fully sold
+        user.positions.splice(positionIndex, 1);
+      } else {
+        // Update remaining balance
+        const { balance: newBalance } = await getTokenBalance(pos.ca, user.address);
+        user.positions[positionIndex].amount = ethers.formatUnits(newBalance, decimals);
+      }
+      
+      dbSaveWallet(String(ctx.from.id), user);
+      
       ctx.telegram.editMessageText(
         ctx.chat.id,
         statusMsg.message_id,
@@ -281,17 +321,30 @@ async function executeSell(ctx, positionIndex, percentage) {
         Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions"), Markup.button.callback("« Menu", "main_menu")]])
       );
     }).catch(err => {
+      console.error("Transaction confirmation error:", err);
       ctx.telegram.editMessageText(
         ctx.chat.id,
         statusMsg.message_id,
         undefined,
-        `⚠️ Sell submitted but confirmation failed. Check hash: ${tx.hash.substring(0, 20)}...`
+        `⚠️ Sell submitted but confirmation failed. Check hash: ${tx.hash.substring(0, 20)}...`,
+        Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions")]])
       );
     });
 
   } catch (err) {
     console.error("Sell error:", err);
-    const errorMsg = `❌ Sell failed: ${err.message.substring(0, 100)}`;
+    
+    let errorMsg = "❌ Sell failed: ";
+    if (err.message.includes("UNSUPPORTED_OPERATION")) {
+      errorMsg += "Contract connection error. Please try again.";
+    } else if (err.message.includes("insufficient funds")) {
+      errorMsg += "Insufficient balance for gas fees.";
+    } else if (err.message.includes("execution reverted")) {
+      errorMsg += "Transaction reverted. Check token balance and try again.";
+    } else {
+      errorMsg += err.message.substring(0, 100);
+    }
+    
     if (ctx.editMessageText) {
       ctx.editMessageText(errorMsg, Markup.inlineKeyboard([[Markup.button.callback("« Back", "positions")]]));
     } else {
@@ -312,14 +365,17 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
 🏷️ Token: ${metadata.symbol}
 💰 Amount: ${user.defaultBuyAmount} MON
 🎯 Slippage: ${user.slippage}%`, 
-      Markup.inlineKeyboard([[Markup.button.callback("⏹️ Cancel", "cancel_buy")]]));
+      Markup.inlineKeyboard([[Markup.button.callback("❌ Cancel", "cancel_buy")]]));
 
     let tx;
     
     if (marketData.market_type === "DEX") {
-      const dexRouterRead = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, provider);
-      const estimatedAmountOut = await dexRouterRead.getAmountOut(tokenAddress, amountIn, true);
-      const minOut = (estimatedAmountOut * BigInt(100 - user.slippage)) / 100n;
+      // FIXED: Use wallet for both read and write operations
+      const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
+      
+      const estimatedAmountOut = await dexRouterWithWallet.getAmountOut(tokenAddress, amountIn, true);
+      const minOut = (estimatedAmountOut * (100n - BigInt(user.slippage))) / 100n;
+
       
       const buyParams = {
         amountOutMin: minOut,
@@ -328,13 +384,12 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
         deadline: deadline
       };
 
-      const dexRouterWrite = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
-      tx = await dexRouterWrite.buy(buyParams, { value: amountIn });
+      tx = await dexRouterWithWallet.buy(buyParams, { value: amountIn });
       
     } else if (marketData.market_type === "CURVE") {
       const bondingCurveRead = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, provider);
       const amountOut = await bondingCurveRead.getAmountOut(tokenAddress, amountIn, true);
-      const minOut = (amountOut * BigInt(100 - user.slippage)) / 100n;
+      const minOut = (amountOut * (100n - BigInt(user.slippage))) / 100n;
 
       const buyParams = {
         amountOutMin: minOut,
@@ -396,14 +451,20 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
 
   } catch (err) {
     console.error(`Auto-buy failed for user ${ctx.from.id}:`, err);
-    ctx.reply(`❌ Auto-buy failed: ${err.message.substring(0, 100)}`, 
+    
+    let errorMsg = "❌ Auto-buy failed: ";
+    if (err.message.includes("UNSUPPORTED_OPERATION")) {
+      errorMsg += "Contract connection error. Please try again.";
+    } else if (err.message.includes("insufficient funds")) {
+      errorMsg += "Insufficient MON balance for purchase + gas fees.";
+    } else {
+      errorMsg += err.message.substring(0, 100);
+    }
+    
+    ctx.reply(errorMsg, 
       Markup.inlineKeyboard([[Markup.button.callback("« Main Menu", "main_menu")]]));
   }
 }
-
-// Contract instances
-const bondingCurveRouter = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, provider);
-const dexRouter = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, provider);
 
 // Commands
 bot.command("auth", (ctx) => {
@@ -486,16 +547,19 @@ bot.action("positions", requireAuth, async (ctx) => {
   let message = "📊 Your Positions:\n\n";
   const enrichedPositions = [];
 
+  // Clean up positions with zero balances first
+  const validPositions = [];
   for (let i = 0; i < user.positions.length; i++) {
     const pos = user.positions[i];
     try {
       const { balance, decimals } = await getTokenBalance(pos.ca, user.address);
-      if (parseFloat(ethers.formatUnits(balance, decimals)) > 0) {
+      const tokenBalance = parseFloat(ethers.formatUnits(balance, decimals));
+      
+      if (tokenBalance > 0) {
         const metadata = await getTokenMetadata(pos.ca);
         const marketData = await getMarketData(pos.ca);
         
         const symbol = metadata?.symbol || pos.ca.substring(0, 8) + "...";
-        const tokenBalance = parseFloat(ethers.formatUnits(balance, decimals));
         const price = marketData?.price ? formatPrice(marketData.price) : "N/A";
         const value = marketData?.price ? formatPrice(tokenBalance * parseFloat(marketData.price)) : "N/A";
         
@@ -508,29 +572,39 @@ bot.action("positions", requireAuth, async (ctx) => {
           pnlText = ` ${pnlColor} ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}%`;
         }
         
-        message += `${i + 1}. ${symbol}
-💰 ${formatTokenAmount(balance, decimals)} tokens
-💵 $${price} MON${pnlText}
-📊 Value: ~${value} MON
-
-`;
-        
-        enrichedPositions.push({
+        const positionInfo = {
           ...pos,
           symbol,
           balance: tokenBalance,
           price,
           value,
-          index: i
-        });
+          index: validPositions.length, // Use validPositions length as index
+          decimals
+        };
+        
+        validPositions.push(pos); // Keep original position for DB
+        enrichedPositions.push(positionInfo);
+        
+        message += `${enrichedPositions.length}. ${symbol}
+💰 ${formatTokenAmount(balance, decimals)} tokens
+💵 ${price} MON${pnlText}
+📊 Value: ~${value} MON
+
+`;
       }
     } catch (error) {
       console.error(`Error loading position ${pos.ca}:`, error);
     }
   }
 
+  // Update user positions to only include valid ones
+  user.positions = validPositions;
+  dbSaveWallet(String(ctx.from.id), user);
+
   if (enrichedPositions.length === 0) {
     message = "📭 No active positions\n\nAll token balances are zero.";
+    return ctx.editMessageText(message, 
+      Markup.inlineKeyboard([[Markup.button.callback("« Back", "main_menu")]]));
   }
 
   ctx.editMessageText(message, createPositionKeyboard(enrichedPositions));
@@ -882,7 +956,7 @@ bot.action("cancel_buy", requireAuth, (ctx) => {
   ctx.editMessageText("❌ Buy cancelled", createMainKeyboard());
 });
 
-// Enhanced buy command with better UX
+// Enhanced buy command with proper wallet usage
 bot.command("buy", requireAuth, async (ctx) => {
   const args = ctx.message.text.split(" ");
   if (args.length < 3 || !ethers.isAddress(args[1])) {
@@ -914,43 +988,31 @@ bot.command("buy", requireAuth, async (ctx) => {
 📊 ${monAmount} MON → ${metadata?.symbol || "tokens"}
 🎯 Slippage: ${user.slippage}%
 📈 Market: ${marketData.market_type}`, 
-      Markup.inlineKeyboard([[Markup.button.callback("⏹️ Cancel", "cancel_buy")]]));
+      Markup.inlineKeyboard([[Markup.button.callback("❌ Cancel", "cancel_buy")]]));
 
     let tx;
     
     if (marketData.market_type === "DEX") {
-      try {
-        const dexRouterRead = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, provider);
-        const estimatedAmountOut = await dexRouterRead.getAmountOut(ca, amountIn, true);
-        const minOut = (estimatedAmountOut * BigInt(100 - user.slippage)) / 100n;
-        
-        const buyParams = {
-          amountOutMin: minOut,
-          token: ca,
-          to: user.address,
-          deadline: deadline
-        };
+      // FIXED: Use wallet for both read and write operations
+      const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
+      
+      const estimatedAmountOut = await dexRouterWithWallet.getAmountOut(ca, amountIn, true);
+      const minOut = (estimatedAmountOut * (100n - BigInt(user.slippage))) / 100n;
 
-        const dexRouterWrite = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
-        tx = await dexRouterWrite.buy(buyParams, { value: amountIn });
+      const buyParams = {
+        amountOutMin: minOut,
+        token: ca,
+        to: user.address,
+        deadline: deadline
+      };
+
+      tx = await dexRouterWithWallet.buy(buyParams, { value: amountIn });
         
-      } catch (dexError) {
-        console.error("DEX buy error:", dexError);
-        if (dexError.message.includes("0x4e969c58")) {
-          return ctx.telegram.editMessageText(
-            ctx.chat.id,
-            statusMsg.message_id,
-            undefined,
-            "❌ DEX buy failed: Token may have insufficient liquidity or may not be properly listed on DEX",
-            createMainKeyboard()
-          );
-        }
-        throw dexError;
-      }
     } else if (marketData.market_type === "CURVE") {
       const bondingCurveRead = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, provider);
       const amountOut = await bondingCurveRead.getAmountOut(ca, amountIn, true);
-      const minOut = (amountOut * BigInt(100 - user.slippage)) / 100n;
+      const minOut = (amountOut * (100n - BigInt(user.slippage))) / 100n;
+
 
       const buyParams = {
         amountOutMin: minOut,
@@ -1010,7 +1072,17 @@ bot.command("buy", requireAuth, async (ctx) => {
 
   } catch (err) {
     console.error("Buy error:", err);
-    ctx.reply(`❌ Buy failed: ${err.message.substring(0, 100)}`, createMainKeyboard());
+    
+    let errorMsg = "❌ Buy failed: ";
+    if (err.message.includes("UNSUPPORTED_OPERATION")) {
+      errorMsg += "Contract connection error. Please try again.";
+    } else if (err.message.includes("insufficient funds")) {
+      errorMsg += "Insufficient MON balance for purchase + gas fees.";
+    } else {
+      errorMsg += err.message.substring(0, 100);
+    }
+    
+    ctx.reply(errorMsg, createMainKeyboard());
   }
 });
 
@@ -1065,16 +1137,19 @@ bot.command("positions", requireAuth, async (ctx) => {
   let message = "📊 Your Positions:\n\n";
   const enrichedPositions = [];
 
+  // Clean up positions with zero balances first
+  const validPositions = [];
   for (let i = 0; i < user.positions.length; i++) {
     const pos = user.positions[i];
     try {
       const { balance, decimals } = await getTokenBalance(pos.ca, user.address);
-      if (parseFloat(ethers.formatUnits(balance, decimals)) > 0) {
+      const tokenBalance = parseFloat(ethers.formatUnits(balance, decimals));
+      
+      if (tokenBalance > 0) {
         const metadata = await getTokenMetadata(pos.ca);
         const marketData = await getMarketData(pos.ca);
         
         const symbol = metadata?.symbol || pos.ca.substring(0, 8) + "...";
-        const tokenBalance = parseFloat(ethers.formatUnits(balance, decimals));
         const price = marketData?.price ? formatPrice(marketData.price) : "N/A";
         const value = marketData?.price ? formatPrice(tokenBalance * parseFloat(marketData.price)) : "N/A";
         
@@ -1087,29 +1162,39 @@ bot.command("positions", requireAuth, async (ctx) => {
           pnlText = ` ${pnlColor} ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}%`;
         }
         
-        message += `${i + 1}. ${symbol}
-💰 ${formatTokenAmount(balance, decimals)} tokens
-💵 ${price} MON${pnlText}
-📊 Value: ~${value} MON
-
-`;
-        
-        enrichedPositions.push({
+        const positionInfo = {
           ...pos,
           symbol,
           balance: tokenBalance,
           price,
           value,
-          index: i
-        });
+          index: validPositions.length, // Use validPositions length as index
+          decimals
+        };
+        
+        validPositions.push(pos); // Keep original position for DB
+        enrichedPositions.push(positionInfo);
+        
+        message += `${enrichedPositions.length}. ${symbol}
+💰 ${formatTokenAmount(balance, decimals)} tokens
+💵 ${price} MON${pnlText}
+📊 Value: ~${value} MON
+
+`;
       }
     } catch (error) {
       console.error(`Error loading position ${pos.ca}:`, error);
     }
   }
 
+  // Update user positions to only include valid ones
+  user.positions = validPositions;
+  dbSaveWallet(String(ctx.from.id), user);
+
   if (enrichedPositions.length === 0) {
     message = "📭 No active positions\n\nAll token balances are zero.";
+    return ctx.reply(message, 
+      Markup.inlineKeyboard([[Markup.button.callback("« Back", "main_menu")]]));
   }
 
   ctx.reply(message, createPositionKeyboard(enrichedPositions));
