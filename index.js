@@ -3,22 +3,21 @@ import { ethers } from "ethers";
 import dotenv from "dotenv";
 import fs from "fs";
 import fetch from "node-fetch";
+import cron from "node-cron";
 
-// Import all ABIs
 import erc20Abi from "./abis/erc20.json" with { type: "json" };
 import bondingCurveRouterAbi from "./abis/bundingcurverouter.json" with { type: "json" };
 import bondingCurveAbi from "./abis/bundingcurve.json" with { type: "json" };
 import dexRouterAbi from "./abis/dexrouter.json" with { type: "json" };
+import tokenAbi from "./abis/token.json" with { type: "json" };
 
 dotenv.config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 
-// Import DB helpers
 import { getWallet as dbGetWallet, saveWallet as dbSaveWallet } from "./db.js";
 
-// NAD.fun Contract Addresses
 const CONTRACTS = {
   BONDING_CURVE: "0x52D34d8536350Cd997bCBD0b9E9d722452f341F5",
   BONDING_CURVE_ROUTER: "0x4F5A3518F082275edf59026f72B66AC2838c0414",
@@ -27,14 +26,13 @@ const CONTRACTS = {
   WMON: "0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701"
 };
 
-// API Base URLs
 const API_BASE = "https://testnet-v3-api.nad.fun";
 const WS_BASE = "wss://testnet-v3-ws.nad.fun/wss";
+const EXPLORER_BASE = "https://testnet.monadexplorer.com/tx";
 
 let authenticatedUsers = new Set();
-let pendingSells = new Map(); // Store pending sell operations
+let pendingActions = new Map();
 
-// Helper functions
 function formatPrice(price) {
   const num = parseFloat(price);
   if (num === 0) return "0.000";
@@ -48,11 +46,85 @@ function formatTokenAmount(amount, decimals = 18) {
   return parseFloat(formatted).toLocaleString();
 }
 
+function formatMcap(mcap) {
+  const num = parseFloat(mcap);
+  if (num >= 1000000) return `$${(num/1000000).toFixed(2)}M`;
+  if (num >= 1000) return `$${(num/1000).toFixed(2)}K`;
+  return `$${num.toFixed(2)}`;
+}
+
+function formatInterval(minutes) {
+  if (minutes >= 1440) {
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    const mins = minutes % 60;
+    if (days > 0 && hours > 0) return `${days}d ${hours}h`;
+    if (days > 0 && mins > 0) return `${days}d ${mins}m`;
+    if (days > 0) return `${days}d`;
+    return `${hours}h ${mins}m`;
+  } else if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    if (mins > 0) return `${hours}h ${mins}m`;
+    return `${hours}h`;
+  } else {
+    return `${minutes}m`;
+  }
+}
+
+function createTxLink(hash) {
+  return `[${hash.substring(0, 12)}...](${EXPLORER_BASE}/${hash})`;
+}
+
 function createMainKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("💰 Wallet", "wallet"), Markup.button.callback("📊 Positions", "positions")],
     [Markup.button.callback("⚙️ Settings", "settings"), Markup.button.callback("📈 Buy", "buy_menu")],
-    [Markup.button.callback("📉 Sell", "sell_menu"), Markup.button.callback("🔄 Refresh", "refresh")]
+    [Markup.button.callback("📉 Sell", "sell_menu"), Markup.button.callback("🤖 Auto Features", "auto_features")],
+    [Markup.button.callback("🔍 Token Info", "token_info"), Markup.button.callback("🔄 Refresh", "refresh")]
+  ]);
+}
+
+function createAutoFeaturesKeyboard(user) {
+  const autobuyStatus = user.autoBuy ? "ON ✅" : "OFF ❌";
+  const autosellStatus = user.autoSell?.enabled ? "ON ✅" : "OFF ❌";
+  const dcaStatus = user.dcaCampaigns?.length > 0 ? `${user.dcaCampaigns.length} Active` : "None";
+  
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`⚡ Auto-buy: ${autobuyStatus}`, "toggle_autobuy")],
+    [Markup.button.callback(`🎯 Auto-sell: ${autosellStatus}`, "autosell_menu")],
+    [Markup.button.callback(`📈 DCA: ${dcaStatus}`, "dca_menu")],
+    [Markup.button.callback("« Back", "main_menu")]
+  ]);
+}
+
+function createDCAKeyboard(campaigns) {
+  const buttons = [];
+  
+  if (campaigns && campaigns.length > 0) {
+    for (let i = 0; i < campaigns.length; i++) {
+      const campaign = campaigns[i];
+      const status = campaign.active ? "🟢" : "🔴";
+      const intervalText = formatInterval(campaign.intervalMinutes);
+      buttons.push([Markup.button.callback(`${status} ${campaign.tokenSymbol || campaign.tokenAddress.substring(0, 8)} (${intervalText})`, `dca_view_${i}`)]);
+    }
+  }
+  
+  buttons.push([Markup.button.callback("➕ New DCA", "dca_new")]);
+  buttons.push([Markup.button.callback("« Back", "auto_features")]);
+  
+  return Markup.inlineKeyboard(buttons);
+}
+
+function createAutosellKeyboard(user) {
+  const enabled = user.autoSell?.enabled || false;
+  
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`${enabled ? "🔴 Disable" : "🟢 Enable"}`, "toggle_autosell")],
+    [Markup.button.callback("🎯 Market Cap Targets", "autosell_mcap")],
+    [Markup.button.callback("📊 Profit/Loss Targets", "autosell_pnl")],
+    [Markup.button.callback("⏰ Time-based Sells", "autosell_time")],
+    [Markup.button.callback("« Back", "auto_features")]
   ]);
 }
 
@@ -100,16 +172,17 @@ function createSellPercentageKeyboard(tokenId) {
   ]);
 }
 
-// Enhanced helper wrappers
 function createWallet(userId) {
   const wallet = ethers.Wallet.createRandom();
   const data = {
     address: wallet.address,
     pk: wallet.privateKey,
     autoBuy: false,
+    autoSell: { enabled: false, triggers: [] },
     slippage: 10,
     positions: [],
-    defaultBuyAmount: "0.1"
+    defaultBuyAmount: "0.1",
+    dcaCampaigns: []
   };
   dbSaveWallet(String(userId), data);
   return data;
@@ -127,7 +200,6 @@ function requireAuth(ctx, next) {
   return next();
 }
 
-// API Functions
 async function getTokenMetadata(tokenAddress) {
   try {
     const response = await fetch(`${API_BASE}/token/metadata/${tokenAddress}`);
@@ -155,6 +227,43 @@ async function getMarketData(tokenAddress) {
   }
 }
 
+async function calculateMarketCap(tokenAddress, price) {
+  try {
+    const token = new ethers.Contract(tokenAddress, tokenAbi, provider);
+    const totalSupply = await token.totalSupply();
+    const decimals = await token.decimals ? await token.decimals() : 18;
+    
+    const supplyInTokens = parseFloat(ethers.formatUnits(totalSupply, decimals));
+    const marketCap = supplyInTokens * parseFloat(price);
+    
+    return marketCap;
+  } catch (error) {
+    console.error("Error calculating market cap:", error);
+    return 0;
+  }
+}
+
+async function getTopHolders(tokenAddress) {
+  try {
+    // Try to fetch real holder data from API first
+    const response = await fetch(`${API_BASE}/token/holders/${tokenAddress}`);
+    if (response.ok) {
+      const data = await response.json();
+      if (data.holders && data.holders.length > 0) {
+        return data.holders.slice(0, 10);
+      }
+    }
+    
+    // Fallback: return empty array or minimal data
+    console.log("No holder data available from API");
+    return [];
+    
+  } catch (error) {
+    console.error("Error fetching top holders:", error);
+    return [];
+  }
+}
+
 async function getTokenBalance(tokenAddress, userAddress) {
   try {
     const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
@@ -177,7 +286,176 @@ async function getMonBalance(address) {
   }
 }
 
-// FIXED executeSell function
+async function checkAutoSellTriggers() {
+  for (const userId of authenticatedUsers) {
+    const user = getWallet(userId);
+    if (!user?.autoSell?.enabled || !user.positions?.length) continue;
+    
+    for (const position of user.positions) {
+      try {
+        const marketData = await getMarketData(position.ca);
+        if (!marketData) continue;
+        
+        const currentPrice = parseFloat(marketData.price);
+        const marketCap = await calculateMarketCap(position.ca, currentPrice);
+        const holdTime = Date.now() - (position.buyTime || 0);
+        
+        for (const trigger of user.autoSell.triggers) {
+          let shouldSell = false;
+          
+          if (trigger.type === 'marketcap' && marketCap >= trigger.value) {
+            shouldSell = true;
+          } else if (trigger.type === 'profit' && position.buyPrice) {
+            const pnl = ((currentPrice - parseFloat(position.buyPrice)) / parseFloat(position.buyPrice)) * 100;
+            if (pnl >= trigger.value) shouldSell = true;
+          } else if (trigger.type === 'loss' && position.buyPrice) {
+            const pnl = ((currentPrice - parseFloat(position.buyPrice)) / parseFloat(position.buyPrice)) * 100;
+            if (pnl <= -trigger.value) shouldSell = true;
+          } else if (trigger.type === 'time' && holdTime >= trigger.value) {
+            shouldSell = true;
+          }
+          
+          if (shouldSell) {
+            await executeAutoSell(userId, position, trigger, marketData);
+          }
+        }
+      } catch (error) {
+        console.error(`Auto-sell check error for user ${userId}:`, error);
+      }
+    }
+  }
+}
+
+async function executeAutoSell(userId, position, trigger, marketData) {
+  try {
+    const user = getWallet(userId);
+    const wallet = new ethers.Wallet(user.pk, provider);
+    
+    const { balance } = await getTokenBalance(position.ca, user.address);
+    const sellAmount = (BigInt(balance) * BigInt(trigger.percentage || 100)) / 100n;
+    
+    if (sellAmount === 0n) return;
+    
+    const token = new ethers.Contract(position.ca, erc20Abi, wallet);
+    const deadline = Math.floor(Date.now() / 1000) + 1800;
+    
+    let tx;
+    if (marketData.market_type === "DEX") {
+      const dexRouter = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
+      await token.approve(CONTRACTS.DEX_ROUTER, sellAmount);
+      
+      const quoteData = await dexRouter.getAmountOut(position.ca, sellAmount, false);
+      const minOut = (quoteData * (100n - BigInt(user.slippage))) / 100n;
+      
+      tx = await dexRouter.sell({
+        amountIn: sellAmount,
+        amountOutMin: minOut,
+        token: position.ca,
+        to: user.address,
+        deadline
+      });
+    } else if (marketData.market_type === "CURVE") {
+      const bondingRouter = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, wallet);
+      await token.approve(CONTRACTS.BONDING_CURVE_ROUTER, sellAmount);
+      
+      tx = await bondingRouter.sell({
+        amountIn: sellAmount,
+        amountOutMin: 0,
+        token: position.ca,
+        to: user.address,
+        deadline
+      });
+    }
+    
+    if (tx) {
+      const metadata = await getTokenMetadata(position.ca);
+      bot.telegram.sendMessage(userId, 
+        `🤖 Auto-sell Executed!\n\n🎯 Trigger: ${trigger.type}\n💰 Token: ${metadata?.symbol || position.ca.substring(0, 12)}\n📊 Amount: ${trigger.percentage || 100}%\n🔗 TX: ${createTxLink(tx.hash)}`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      user.autoSell.triggers = user.autoSell.triggers.filter(t => t !== trigger);
+      dbSaveWallet(String(userId), user);
+    }
+  } catch (error) {
+    console.error("Auto-sell execution error:", error);
+  }
+}
+
+async function executeDCA() {
+  for (const userId of authenticatedUsers) {
+    const user = getWallet(userId);
+    if (!user?.dcaCampaigns?.length) continue;
+    
+    for (let i = 0; i < user.dcaCampaigns.length; i++) {
+      const campaign = user.dcaCampaigns[i];
+      if (!campaign.active || campaign.nextExecution > Date.now()) continue;
+      
+      try {
+        const marketData = await getMarketData(campaign.tokenAddress);
+        const metadata = await getTokenMetadata(campaign.tokenAddress);
+        
+        if (!marketData) continue;
+        
+        const wallet = new ethers.Wallet(user.pk, provider);
+        const amountIn = ethers.parseEther(campaign.amount);
+        
+        let tx;
+        if (marketData.market_type === "DEX") {
+          const dexRouter = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
+          const estimatedAmountOut = await dexRouter.getAmountOut(campaign.tokenAddress, amountIn, true);
+          const minOut = (estimatedAmountOut * (100n - BigInt(user.slippage))) / 100n;
+          
+          tx = await dexRouter.buy({
+            amountOutMin: minOut,
+            token: campaign.tokenAddress,
+            to: user.address,
+            deadline: Math.floor(Date.now() / 1000) + 1800
+          }, { value: amountIn });
+        } else if (marketData.market_type === "CURVE") {
+          const bondingRouter = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, wallet);
+          const amountOut = await bondingRouter.getAmountOut(campaign.tokenAddress, amountIn, true);
+          const minOut = (amountOut * (100n - BigInt(user.slippage))) / 100n;
+          
+          tx = await bondingRouter.buy({
+            amountOutMin: minOut,
+            token: campaign.tokenAddress,
+            to: user.address,
+            deadline: Math.floor(Date.now() / 1000) + 1800
+          }, { value: amountIn });
+        }
+        
+        if (tx) {
+          user.dcaCampaigns[i].executedCount++;
+          user.dcaCampaigns[i].nextExecution = Date.now() + (campaign.intervalMinutes * 60 * 1000);
+          
+          if (user.dcaCampaigns[i].executedCount >= campaign.maxExecutions) {
+            user.dcaCampaigns[i].active = false;
+          }
+          
+          bot.telegram.sendMessage(userId,
+            `📈 DCA Buy Executed!\n\n💰 Token: ${metadata?.symbol || campaign.tokenAddress.substring(0, 12)}\n💵 Amount: ${campaign.amount} MON\n🔄 Execution: ${user.dcaCampaigns[i].executedCount}/${campaign.maxExecutions}\n🔗 TX: ${createTxLink(tx.hash)}`,
+            { parse_mode: 'Markdown' }
+          );
+          
+          const existingPosition = user.positions.find(p => p.ca === campaign.tokenAddress);
+          if (!existingPosition) {
+            user.positions.push({
+              ca: campaign.tokenAddress,
+              amount: "?",
+              buyPrice: marketData.price,
+              buyTime: Date.now()
+            });
+          }
+          dbSaveWallet(String(userId), user);
+        }
+      } catch (error) {
+        console.error(`DCA execution error for user ${userId}, campaign ${i}:`, error);
+      }
+    }
+  }
+}
+
 async function executeSell(ctx, positionIndex, percentage) {
   const user = getWallet(ctx.from.id);
   if (!user || !user.positions[positionIndex]) {
@@ -210,7 +488,6 @@ async function executeSell(ctx, positionIndex, percentage) {
     const sellAmount = (BigInt(balance) * BigInt(percentage)) / BigInt(100);
     
     if (sellAmount === 0n) {
-      // Remove empty position
       user.positions.splice(positionIndex, 1);
       dbSaveWallet(String(ctx.from.id), user);
       
@@ -232,23 +509,16 @@ async function executeSell(ctx, positionIndex, percentage) {
 
     const token = new ethers.Contract(pos.ca, erc20Abi, wallet);
     const deadline = Math.floor(Date.now() / 1000) + 1800;
-    let routerAddress;
     let tx;
     
     if (marketData.market_type === "DEX") {
-      routerAddress = CONTRACTS.DEX_ROUTER;
-      
-      // Approve tokens for DEX router
-      const approveTx = await token.approve(routerAddress, sellAmount);
-      await approveTx.wait();
-      
-      // FIXED: Use wallet for both read and write operations
       const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
       
-      // Get quote using wallet-connected contract
+      const approveTx = await token.approve(CONTRACTS.DEX_ROUTER, sellAmount);
+      await approveTx.wait();
+      
       const quoteData = await dexRouterWithWallet.getAmountOut(pos.ca, sellAmount, false);
       const minOut = (quoteData * (100n - BigInt(user.slippage))) / 100n;
-
 
       const sellParams = {
         amountIn: sellAmount,
@@ -258,19 +528,15 @@ async function executeSell(ctx, positionIndex, percentage) {
         deadline: deadline
       };
 
-      // Execute sell
       tx = await dexRouterWithWallet.sell(sellParams);
       
     } else if (marketData.market_type === "CURVE") {
-      routerAddress = CONTRACTS.BONDING_CURVE_ROUTER;
-      
-      // Approve tokens for bonding curve router
-      const approveTx = await token.approve(routerAddress, sellAmount);
+      const approveTx = await token.approve(CONTRACTS.BONDING_CURVE_ROUTER, sellAmount);
       await approveTx.wait();
       
       const sellParams = {
         amountIn: sellAmount,
-        amountOutMin: 0, // Could add slippage protection here too
+        amountOutMin: 0,
         token: pos.ca,
         to: user.address,
         deadline: deadline
@@ -296,14 +562,10 @@ async function executeSell(ctx, positionIndex, percentage) {
       `⏳ Sell submitted! Hash: ${tx.hash.substring(0, 20)}...`
     );
 
-    // Handle transaction confirmation
     tx.wait().then(async () => {
-      // Update position after successful sell
       if (percentage === 100) {
-        // Remove position if fully sold
         user.positions.splice(positionIndex, 1);
       } else {
-        // Update remaining balance
         const { balance: newBalance } = await getTokenBalance(pos.ca, user.address);
         user.positions[positionIndex].amount = ethers.formatUnits(newBalance, decimals);
       }
@@ -317,8 +579,11 @@ async function executeSell(ctx, positionIndex, percentage) {
         `✅ Sell Complete!
 🎯 Sold ${percentage}% of ${metadata?.symbol || "tokens"}
 💰 ${formatTokenAmount(sellAmount, decimals)} tokens
-🔗 ${tx.hash.substring(0, 20)}...`,
-        Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions"), Markup.button.callback("« Menu", "main_menu")]])
+🔗 TX: ${createTxLink(tx.hash)}`,
+        { 
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions"), Markup.button.callback("« Menu", "main_menu")]])
+        }
       );
     }).catch(err => {
       console.error("Transaction confirmation error:", err);
@@ -326,8 +591,11 @@ async function executeSell(ctx, positionIndex, percentage) {
         ctx.chat.id,
         statusMsg.message_id,
         undefined,
-        `⚠️ Sell submitted but confirmation failed. Check hash: ${tx.hash.substring(0, 20)}...`,
-        Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions")]])
+        `⚠️ Sell submitted but confirmation failed. Check hash: ${createTxLink(tx.hash)}`,
+        { 
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.callback("📊 Positions", "positions")]])
+        }
       );
     });
 
@@ -353,7 +621,6 @@ async function executeSell(ctx, positionIndex, percentage) {
   }
 }
 
-// FIXED executeAutoBuy function
 async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
   const wallet = new ethers.Wallet(user.pk, provider);
   
@@ -370,12 +637,10 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
     let tx;
     
     if (marketData.market_type === "DEX") {
-      // FIXED: Use wallet for both read and write operations
       const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
       
       const estimatedAmountOut = await dexRouterWithWallet.getAmountOut(tokenAddress, amountIn, true);
       const minOut = (estimatedAmountOut * (100n - BigInt(user.slippage))) / 100n;
-
       
       const buyParams = {
         amountOutMin: minOut,
@@ -439,7 +704,7 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
 💰 Bought: ${user.defaultBuyAmount} MON worth
 💵 Price: ${formatPrice(marketData.price)} MON
 📈 Market: ${marketData.market_type}
-🔗 Hash: ${tx.hash.substring(0, 20)}...`,
+🔗 Hash: ${createTxLink(tx.hash)}`,
       {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
@@ -466,7 +731,68 @@ async function executeAutoBuy(ctx, tokenAddress, metadata, marketData, user) {
   }
 }
 
-// Commands
+async function analyzeToken(ctx, tokenAddress) {
+  try {
+    const statusMsg = await ctx.reply("🔍 Analyzing token... Please wait");
+    
+    const [metadata, marketData, topHolders] = await Promise.all([
+      getTokenMetadata(tokenAddress),
+      getMarketData(tokenAddress),
+      getTopHolders(tokenAddress)
+    ]);
+    
+    if (!metadata) {
+      return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, "❌ Token not found");
+    }
+    
+    const price = marketData?.price ? formatPrice(marketData.price) : "N/A";
+    const marketCap = marketData?.price ? await calculateMarketCap(tokenAddress, marketData.price) : 0;
+    
+    let holdersText = "👥 Top Holders:\n";
+    let totalTopHoldersPercentage = 0;
+    
+    if (topHolders.length > 0) {
+      topHolders.forEach((holder, index) => {
+        totalTopHoldersPercentage += parseFloat(holder.percentage);
+        holdersText += `${index + 1}. ${holder.address.substring(0, 8)}... - ${holder.percentage}%\n`;
+      });
+      holdersText += `\n📊 Top ${topHolders.length} holders own: ${totalTopHoldersPercentage.toFixed(2)}%`;
+    } else {
+      holdersText += "No holder data available\n";
+    }
+    
+    const analysisText = `🔍 Token Analysis
+
+🏷️ ${metadata.name} (${metadata.symbol})
+📍 ${tokenAddress.substring(0, 12)}...${tokenAddress.substring(tokenAddress.length - 8)}
+💰 Price: ${price} MON
+📊 Market Cap: ${formatMcap(marketCap)}
+📈 Market Type: ${marketData?.market_type || "Unknown"}
+
+${holdersText}`;
+    
+    ctx.telegram.editMessageText(
+      ctx.chat.id, 
+      statusMsg.message_id, 
+      undefined, 
+      analysisText,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`⚡ Buy ${getWallet(ctx.from.id).defaultBuyAmount} MON`, `quick_buy_${tokenAddress}`)],
+        [Markup.button.callback("🎯 Set Auto-sell", `set_autosell_${tokenAddress}`)],
+        [Markup.button.callback("« Back", "main_menu")]
+      ])
+    );
+  } catch (error) {
+    console.error("Token analysis error:", error);
+    ctx.reply("❌ Analysis failed. Please try again.");
+  }
+}
+
+// Cron jobs for automated features
+cron.schedule('*/1 * * * *', checkAutoSellTriggers);
+cron.schedule('*/1 * * * *', executeDCA);
+
+// Bot command handlers
 bot.command("auth", (ctx) => {
   const args = ctx.message.text.split(" ");
   if (args.length < 2) {
@@ -476,27 +802,381 @@ bot.command("auth", (ctx) => {
   
   if (password === "mbdagoat") {
     authenticatedUsers.add(ctx.from.id);
-    ctx.reply("✅ Welcome to NAD Bot!", createMainKeyboard());
+    ctx.reply("✅ Welcome to Enhanced NAD Bot!", createMainKeyboard());
   } else {
     ctx.reply("❌ Invalid password. Access denied.");
   }
 });
 
 bot.start((ctx) => {
-  ctx.reply(`🚀 Welcome to NAD Trading Bot!
+  ctx.reply(`🚀 Enhanced NAD Trading Bot!
 
 🔐 This bot is password protected.
-Use /auth <password> to authenticate and access all features.`, 
+Use /auth <password> to authenticate.
+
+✨ Features:
+• 🤖 Auto-sell at market cap targets
+• 📈 DCA (Dollar Cost Averaging)
+• 👥 Token holder analysis
+• 🔗 Clickable transaction links
+• ⚡ Advanced automation
+• ⏱️ Minute-level DCA intervals`, 
     Markup.inlineKeyboard([[Markup.button.callback("🔐 Authenticate", "need_auth")]]));
 });
 
-// Callback query handlers
 bot.action("need_auth", (ctx) => {
   ctx.editMessageText("Please use /auth <password> to authenticate");
 });
 
 bot.action("main_menu", requireAuth, (ctx) => {
-  ctx.editMessageText("🚀 NAD Trading Bot", createMainKeyboard());
+  ctx.editMessageText("🚀 Enhanced NAD Trading Bot", createMainKeyboard());
+});
+
+bot.action("auto_features", requireAuth, (ctx) => {
+  const user = getWallet(ctx.from.id);
+  if (!user) return ctx.answerCbQuery("❌ No wallet found");
+  
+  ctx.editMessageText("🤖 Auto Trading Features", createAutoFeaturesKeyboard(user));
+});
+
+bot.action("autosell_menu", requireAuth, (ctx) => {
+  const user = getWallet(ctx.from.id);
+  if (!user) return ctx.answerCbQuery("❌ No wallet found");
+  
+  ctx.editMessageText("🎯 Auto-sell Settings", createAutosellKeyboard(user));
+});
+
+bot.action("toggle_autosell", requireAuth, (ctx) => {
+  const user = getWallet(ctx.from.id);
+  if (!user) return ctx.answerCbQuery("❌ No wallet found");
+  
+  if (!user.autoSell) user.autoSell = { enabled: false, triggers: [] };
+  user.autoSell.enabled = !user.autoSell.enabled;
+  
+  dbSaveWallet(String(ctx.from.id), user);
+  ctx.editMessageText("🎯 Auto-sell Settings", createAutosellKeyboard(user));
+  ctx.answerCbQuery(`Auto-sell ${user.autoSell.enabled ? "enabled" : "disabled"}!`);
+});
+
+bot.action("autosell_mcap", requireAuth, (ctx) => {
+  ctx.editMessageText("🎯 Market Cap Target\n\nEnter market cap in millions (e.g., 5 for $5M):");
+  pendingActions.set(ctx.from.id, { type: 'autosell_mcap_value' });
+});
+
+bot.action("autosell_pnl", requireAuth, (ctx) => {
+  ctx.editMessageText("📊 Profit/Loss Target\n\nEnter profit percentage to auto-sell (e.g., 50 for +50%):");
+  pendingActions.set(ctx.from.id, { type: 'autosell_profit_value' });
+});
+
+bot.action("autosell_time", requireAuth, (ctx) => {
+  ctx.editMessageText("⏰ Time-based Auto-sell\n\nEnter minutes to hold before auto-sell (e.g., 60 for 1 hour, 1440 for 1 day):");
+  pendingActions.set(ctx.from.id, { type: 'autosell_time_value' });
+});
+
+bot.action("dca_menu", requireAuth, (ctx) => {
+  const user = getWallet(ctx.from.id);
+  if (!user) return ctx.answerCbQuery("❌ No wallet found");
+  
+  const campaigns = user.dcaCampaigns || [];
+  ctx.editMessageText("📈 DCA Campaigns", createDCAKeyboard(campaigns));
+});
+
+bot.action("dca_new", requireAuth, (ctx) => {
+  ctx.editMessageText("📈 New DCA Campaign\n\nEnter token address:");
+  pendingActions.set(ctx.from.id, { type: 'dca_token' });
+});
+
+bot.action(/^dca_view_(\d+)$/, requireAuth, async (ctx) => {
+  const campaignIndex = parseInt(ctx.match[1]);
+  const user = getWallet(ctx.from.id);
+  
+  if (!user?.dcaCampaigns?.[campaignIndex]) {
+    return ctx.answerCbQuery("❌ Campaign not found");
+  }
+  
+  const campaign = user.dcaCampaigns[campaignIndex];
+  const metadata = await getTokenMetadata(campaign.tokenAddress);
+  const nextExecutionTime = new Date(campaign.nextExecution).toLocaleString();
+  const status = campaign.active ? "🟢 Active" : "🔴 Inactive";
+  const progress = `${campaign.executedCount}/${campaign.maxExecutions}`;
+  const intervalText = formatInterval(campaign.intervalMinutes);
+  
+  const message = `📈 DCA Campaign Details
+
+💰 Token: ${metadata?.symbol || campaign.tokenSymbol}
+📍 Address: ${campaign.tokenAddress.substring(0, 12)}...
+💵 Amount per buy: ${campaign.amount} MON
+⏰ Interval: ${intervalText}
+🔄 Progress: ${progress} executions
+📊 Status: ${status}
+⏳ Next execution: ${campaign.active ? nextExecutionTime : 'Completed'}
+
+Created: ${new Date(campaign.created).toLocaleDateString()}`;
+
+  ctx.editMessageText(message, Markup.inlineKeyboard([
+    [Markup.button.callback(campaign.active ? "⏸️ Pause" : "▶️ Resume", `dca_toggle_${campaignIndex}`)],
+    [Markup.button.callback("🗑️ Delete", `dca_delete_${campaignIndex}`)],
+    [Markup.button.callback("« Back", "dca_menu")]
+  ]));
+});
+
+bot.action(/^dca_toggle_(\d+)$/, requireAuth, (ctx) => {
+  const campaignIndex = parseInt(ctx.match[1]);
+  const user = getWallet(ctx.from.id);
+  
+  if (!user?.dcaCampaigns?.[campaignIndex]) {
+    return ctx.answerCbQuery("❌ Campaign not found");
+  }
+  
+  user.dcaCampaigns[campaignIndex].active = !user.dcaCampaigns[campaignIndex].active;
+  
+  if (user.dcaCampaigns[campaignIndex].active && user.dcaCampaigns[campaignIndex].executedCount < user.dcaCampaigns[campaignIndex].maxExecutions) {
+    user.dcaCampaigns[campaignIndex].nextExecution = Date.now() + (user.dcaCampaigns[campaignIndex].intervalMinutes * 60 * 1000);
+  }
+  
+  dbSaveWallet(String(ctx.from.id), user);
+  
+  const status = user.dcaCampaigns[campaignIndex].active ? "resumed" : "paused";
+  ctx.answerCbQuery(`✅ Campaign ${status}!`);
+  
+  setTimeout(() => {
+    ctx.emit(`action:dca_view_${campaignIndex}`);
+  }, 100);
+});
+
+bot.action(/^dca_delete_(\d+)$/, requireAuth, (ctx) => {
+  const campaignIndex = parseInt(ctx.match[1]);
+  const user = getWallet(ctx.from.id);
+  
+  if (!user?.dcaCampaigns?.[campaignIndex]) {
+    return ctx.answerCbQuery("❌ Campaign not found");
+  }
+  
+  user.dcaCampaigns.splice(campaignIndex, 1);
+  dbSaveWallet(String(ctx.from.id), user);
+  
+  ctx.answerCbQuery("✅ Campaign deleted!");
+  ctx.editMessageText("📈 DCA Campaigns", createDCAKeyboard(user.dcaCampaigns));
+});
+
+bot.action("token_info", requireAuth, (ctx) => {
+  ctx.editMessageText("🔍 Token Analysis\n\nEnter token address to analyze:");
+  pendingActions.set(ctx.from.id, { type: 'token_info' });
+});
+
+bot.on("text", requireAuth, async (ctx) => {
+  const text = ctx.message.text.trim();
+  
+  if (pendingActions.has(ctx.from.id)) {
+    const action = pendingActions.get(ctx.from.id);
+    
+    switch (action.type) {
+      case 'autosell_mcap_value':
+        const mcap = parseFloat(text);
+        if (isNaN(mcap) || mcap <= 0) {
+          return ctx.reply("❌ Invalid market cap. Please enter a positive number.");
+        }
+        
+        const user = getWallet(ctx.from.id);
+        if (!user.autoSell) user.autoSell = { enabled: true, triggers: [] };
+        
+        user.autoSell.triggers.push({
+          type: 'marketcap',
+          value: mcap * 1000000,
+          percentage: 100
+        });
+        
+        dbSaveWallet(String(ctx.from.id), user);
+        pendingActions.delete(ctx.from.id);
+        
+        ctx.reply(`✅ Auto-sell trigger set for ${formatMcap(mcap * 1000000)} market cap!`, createAutosellKeyboard(user));
+        break;
+        
+      case 'autosell_profit_value':
+        const profit = parseFloat(text);
+        if (isNaN(profit) || profit <= 0) {
+          return ctx.reply("❌ Invalid profit percentage. Please enter a positive number.");
+        }
+        
+        const userProfit = getWallet(ctx.from.id);
+        if (!userProfit.autoSell) userProfit.autoSell = { enabled: true, triggers: [] };
+        
+        userProfit.autoSell.triggers.push({
+          type: 'profit',
+          value: profit,
+          percentage: 100
+        });
+        
+        dbSaveWallet(String(ctx.from.id), userProfit);
+        pendingActions.delete(ctx.from.id);
+        
+        ctx.reply(`✅ Auto-sell trigger set for +${profit}% profit!`, createAutosellKeyboard(userProfit));
+        break;
+        
+      case 'autosell_time_value':
+        const minutes = parseInt(text);
+        if (isNaN(minutes) || minutes <= 0) {
+          return ctx.reply("❌ Invalid time. Please enter a positive number of minutes.");
+        }
+        
+        const userTime = getWallet(ctx.from.id);
+        if (!userTime.autoSell) userTime.autoSell = { enabled: true, triggers: [] };
+        
+        userTime.autoSell.triggers.push({
+          type: 'time',
+          value: minutes * 60 * 1000,
+          percentage: 100
+        });
+        
+        dbSaveWallet(String(ctx.from.id), userTime);
+        pendingActions.delete(ctx.from.id);
+        
+        ctx.reply(`✅ Auto-sell trigger set for ${formatInterval(minutes)} hold time!`, createAutosellKeyboard(userTime));
+        break;
+        
+      case 'slippage':
+        const slippage = parseFloat(text);
+        if (isNaN(slippage) || slippage < 1 || slippage > 50) {
+          return ctx.reply("❌ Invalid slippage. Enter a number between 1 and 50.");
+        }
+        
+        const userSlippage = getWallet(ctx.from.id);
+        userSlippage.slippage = slippage;
+        dbSaveWallet(String(ctx.from.id), userSlippage);
+        pendingActions.delete(ctx.from.id);
+        
+        return ctx.reply(`✅ Slippage set to ${slippage}%`, createSettingsKeyboard(userSlippage));
+        
+      case 'default_amount':
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount <= 0) {
+          return ctx.reply("❌ Invalid amount. Enter a positive number.");
+        }
+        
+        const userAmount = getWallet(ctx.from.id);
+        userAmount.defaultBuyAmount = text;
+        dbSaveWallet(String(ctx.from.id), userAmount);
+        pendingActions.delete(ctx.from.id);
+        
+        return ctx.reply(`✅ Default buy amount set to ${text} MON`, createSettingsKeyboard(userAmount));
+        
+      case 'dca_token':
+        if (!ethers.isAddress(text)) {
+          return ctx.reply("❌ Invalid token address.");
+        }
+        
+        pendingActions.set(ctx.from.id, { type: 'dca_amount', tokenAddress: text });
+        ctx.reply("💰 Enter amount in MON per buy (e.g., 0.1):");
+        break;
+        
+      case 'dca_amount':
+        const dcaAmount = parseFloat(text);
+        if (isNaN(dcaAmount) || dcaAmount <= 0) {
+          return ctx.reply("❌ Invalid amount. Please enter a positive number.");
+        }
+        
+        const actionData = pendingActions.get(ctx.from.id);
+        pendingActions.set(ctx.from.id, { ...actionData, type: 'dca_interval', amount: text });
+        ctx.reply("⏰ Enter interval in minutes (e.g., 5 for 5 minutes, 60 for 1 hour, 1440 for daily):");
+        break;
+        
+      case 'dca_interval':
+        const intervalMinutes = parseInt(text);
+        if (isNaN(intervalMinutes) || intervalMinutes <= 0) {
+          return ctx.reply("❌ Invalid interval. Please enter a positive number of minutes.");
+        }
+        
+        const dcaData = pendingActions.get(ctx.from.id);
+        pendingActions.set(ctx.from.id, { ...dcaData, type: 'dca_executions', intervalMinutes: intervalMinutes });
+        ctx.reply("🔄 Enter total number of buys (e.g., 10):");
+        break;
+        
+      case 'dca_executions':
+        const executions = parseInt(text);
+        if (isNaN(executions) || executions <= 0) {
+          return ctx.reply("❌ Invalid number. Please enter a positive number.");
+        }
+        
+        const finalDcaData = pendingActions.get(ctx.from.id);
+        const user2 = getWallet(ctx.from.id);
+        
+        if (!user2.dcaCampaigns) user2.dcaCampaigns = [];
+        
+        const metadata = await getTokenMetadata(finalDcaData.tokenAddress);
+        
+        const campaign = {
+          id: Date.now(),
+          tokenAddress: finalDcaData.tokenAddress,
+          tokenSymbol: metadata?.symbol || finalDcaData.tokenAddress.substring(0, 8),
+          amount: finalDcaData.amount,
+          intervalMinutes: finalDcaData.intervalMinutes,
+          maxExecutions: executions,
+          executedCount: 0,
+          active: true,
+          created: Date.now(),
+          nextExecution: Date.now() + (finalDcaData.intervalMinutes * 60 * 1000)
+        };
+        
+        user2.dcaCampaigns.push(campaign);
+        
+        dbSaveWallet(String(ctx.from.id), user2);
+        pendingActions.delete(ctx.from.id);
+        
+        const intervalText = formatInterval(finalDcaData.intervalMinutes);
+        
+        ctx.reply(`✅ DCA Campaign Created!\n\n💰 Amount: ${campaign.amount} MON\n⏰ Interval: ${intervalText}\n🔄 Total Buys: ${campaign.maxExecutions}\n🚀 Starting in ${intervalText}!`, createDCAKeyboard(user2.dcaCampaigns));
+        break;
+        
+      case 'token_info':
+        if (!ethers.isAddress(text)) {
+          return ctx.reply("❌ Invalid token address.");
+        }
+        
+        await analyzeToken(ctx, text);
+        pendingActions.delete(ctx.from.id);
+        break;
+    }
+    return;
+  }
+  
+  // Handle token address detection for auto-buy
+  if (text.startsWith("0x") && text.length === 42 && ethers.isAddress(text)) {
+    const user = getWallet(ctx.from.id);
+    if (!user) return;
+
+    const metadata = await getTokenMetadata(text);
+    const marketData = await getMarketData(text);
+
+    if (!metadata) {
+      return ctx.reply(`❌ Token not found: ${text.substring(0, 12)}...`, createMainKeyboard());
+    }
+
+    const price = marketData?.price ? formatPrice(marketData.price) : "N/A";
+    const marketCap = marketData?.price ? await calculateMarketCap(text, marketData.price) : 0;
+    
+    if (!user.autoBuy) {
+      return ctx.reply(`🔍 Token Detected: ${metadata.symbol}
+
+🏷️ Name: ${metadata.name}
+📍 Address: ${text.substring(0, 12)}...
+📈 Market: ${marketData?.market_type || "Unknown"}
+💰 Price: ${price} MON
+📊 Market Cap: ${formatMcap(marketCap)}
+
+⚡ Auto-buy is OFF`, 
+        Markup.inlineKeyboard([
+          [Markup.button.callback(`⚡ Buy ${user.defaultBuyAmount} MON`, `quick_buy_${text}`)],
+          [Markup.button.callback("🔍 Analyze Token", `analyze_${text}`)],
+          [Markup.button.callback("⚙️ Enable Auto-buy", "toggle_autobuy"), Markup.button.callback("« Back", "main_menu")]
+        ]));
+    }
+
+    if (!marketData) {
+      return ctx.reply(`❌ Token ${metadata.symbol} is not tradeable yet`, createMainKeyboard());
+    }
+
+    await executeAutoBuy(ctx, text, metadata, marketData, user);
+  }
 });
 
 bot.action("wallet", requireAuth, async (ctx) => {
@@ -505,9 +1185,9 @@ bot.action("wallet", requireAuth, async (ctx) => {
 
   const monBalance = await getMonBalance(user.address);
   
-  const message = `💤 Your Wallet
+  const message = `👤 Your Wallet
 
-🏦 Address: \`${user.address}\`
+🦀 Address: \`${user.address}\`
 💰 Balance: ${formatPrice(monBalance)} MON
 ⚡ Auto-buy: ${user.autoBuy ? "ON ✅" : "OFF ❌"}
 🎯 Slippage: ${user.slippage}%
@@ -546,9 +1226,8 @@ bot.action("positions", requireAuth, async (ctx) => {
 
   let message = "📊 Your Positions:\n\n";
   const enrichedPositions = [];
-
-  // Clean up positions with zero balances first
   const validPositions = [];
+  
   for (let i = 0; i < user.positions.length; i++) {
     const pos = user.positions[i];
     try {
@@ -578,11 +1257,11 @@ bot.action("positions", requireAuth, async (ctx) => {
           balance: tokenBalance,
           price,
           value,
-          index: validPositions.length, // Use validPositions length as index
+          index: validPositions.length,
           decimals
         };
         
-        validPositions.push(pos); // Keep original position for DB
+        validPositions.push(pos);
         enrichedPositions.push(positionInfo);
         
         message += `${enrichedPositions.length}. ${symbol}
@@ -597,12 +1276,11 @@ bot.action("positions", requireAuth, async (ctx) => {
     }
   }
 
-  // Update user positions to only include valid ones
   user.positions = validPositions;
   dbSaveWallet(String(ctx.from.id), user);
 
   if (enrichedPositions.length === 0) {
-    message = "📭 No active positions\n\nAll token balances are zero.";
+    message = "🔭 No active positions\n\nAll token balances are zero.";
     return ctx.editMessageText(message, 
       Markup.inlineKeyboard([[Markup.button.callback("« Back", "main_menu")]]));
   }
@@ -637,7 +1315,7 @@ bot.action(/^position_(\d+)$/, requireAuth, async (ctx) => {
 
   const message = `📊 ${symbol} Position
 
-🏦 Address: ${pos.ca.substring(0, 12)}...
+🦀 Address: ${pos.ca.substring(0, 12)}...
 💰 Balance: ${formatTokenAmount(balance, decimals)}
 💵 Price: ${price} MON
 ${pnlText}
@@ -647,7 +1325,6 @@ Choose sell amount:`;
   ctx.editMessageText(message, createSellPercentageKeyboard(positionIndex));
 });
 
-// FIXED: Handle percentage sells
 bot.action(/^sell_percent_(\d+)_(\d+)$/, requireAuth, async (ctx) => {
   const [, positionIndex, percentage] = ctx.match;
   
@@ -664,148 +1341,10 @@ bot.action(/^sell_percent_(\d+)_(\d+)$/, requireAuth, async (ctx) => {
 
 bot.action(/^sell_custom_(\d+)$/, requireAuth, (ctx) => {
   const positionIndex = ctx.match[1];
-  pendingSells.set(ctx.from.id, { type: 'custom', positionIndex: parseInt(positionIndex) });
+  pendingActions.set(ctx.from.id, { type: 'custom_sell', positionIndex: parseInt(positionIndex) });
   ctx.editMessageText("💰 Enter the amount of tokens to sell:\n\nReply with just the number (e.g., 1000000)");
 });
 
-bot.command("sell", requireAuth, async (ctx) => {
-  const args = ctx.message.text.split(" ");
-  if (args.length < 2) {
-    return ctx.reply("Usage: /sell <token_address_or_symbol> [amount_or_percentage]\n\nExamples:\n/sell 0x123...abc 50%\n/sell PEPE 1000000\n/sell baddog 25%");
-  }
-
-  const [cmd, tokenInput, amountInput] = args;
-  const user = getWallet(ctx.from.id);
-  if (!user) return ctx.reply("❌ No wallet found");
-
-  let targetPosition = null;
-  let positionIndex = -1;
-
-  if (ethers.isAddress(tokenInput)) {
-    positionIndex = user.positions.findIndex(p => p.ca.toLowerCase() === tokenInput.toLowerCase());
-    if (positionIndex !== -1) targetPosition = user.positions[positionIndex];
-  } else {
-    for (let i = 0; i < user.positions.length; i++) {
-      const pos = user.positions[i];
-      try {
-        const metadata = await getTokenMetadata(pos.ca);
-        if (metadata?.symbol?.toLowerCase() === tokenInput.toLowerCase()) {
-          targetPosition = pos;
-          positionIndex = i;
-          break;
-        }
-      } catch (error) {
-        continue;
-      }
-    }
-  }
-
-  if (!targetPosition) {
-    return ctx.reply("❌ Token not found in your positions");
-  }
-
-  if (!amountInput) {
-    const metadata = await getTokenMetadata(targetPosition.ca);
-    const message = `Select sell amount for ${metadata?.symbol || "token"}:`;
-    return ctx.reply(message, createSellPercentageKeyboard(positionIndex));
-  }
-
-  if (amountInput.endsWith('%')) {
-    const percentage = parseInt(amountInput.replace('%', ''));
-    if (percentage > 0 && percentage <= 100) {
-      await executeSell({ reply: (text, markup) => ctx.reply(text, markup), chat: ctx.chat }, positionIndex, percentage);
-    } else {
-      ctx.reply("❌ Invalid percentage. Use 1-100%");
-    }
-  } else {
-    ctx.reply("🚧 Specific amount selling will be implemented soon. Use percentages for now.");
-  }
-});
-
-// FIXED: Enhanced text handler
-bot.on("text", requireAuth, async (ctx) => {
-  const text = ctx.message.text.trim();
-  
-  if (pendingSells.has(ctx.from.id)) {
-    const pendingAction = pendingSells.get(ctx.from.id);
-    
-    if (pendingAction.type === 'slippage') {
-      const slippage = parseFloat(text);
-      if (isNaN(slippage) || slippage < 1 || slippage > 50) {
-        return ctx.reply("❌ Invalid slippage. Enter a number between 1 and 50.");
-      }
-      
-      const user = getWallet(ctx.from.id);
-      user.slippage = slippage;
-      dbSaveWallet(String(ctx.from.id), user);
-      pendingSells.delete(ctx.from.id);
-      
-      return ctx.reply(`✅ Slippage set to ${slippage}%`, createSettingsKeyboard(user));
-    }
-    
-    if (pendingAction.type === 'default_amount') {
-      const amount = parseFloat(text);
-      if (isNaN(amount) || amount <= 0) {
-        return ctx.reply("❌ Invalid amount. Enter a positive number.");
-      }
-      
-      const user = getWallet(ctx.from.id);
-      user.defaultBuyAmount = text;
-      dbSaveWallet(String(ctx.from.id), user);
-      pendingSells.delete(ctx.from.id);
-      
-      return ctx.reply(`✅ Default buy amount set to ${text} MON`, createSettingsKeyboard(user));
-    }
-    
-    if (pendingAction.type === 'custom') {
-      const amount = parseFloat(text);
-      if (isNaN(amount) || amount <= 0) {
-        return ctx.reply("❌ Invalid amount. Please enter a valid number.");
-      }
-      
-      pendingSells.delete(ctx.from.id);
-      await executeSell(ctx, pendingAction.positionIndex, 100);
-      return;
-    }
-  }
-
-  if (text.startsWith("0x") && text.length === 42 && ethers.isAddress(text)) {
-    const user = getWallet(ctx.from.id);
-    if (!user) return;
-
-    const metadata = await getTokenMetadata(text);
-    const marketData = await getMarketData(text);
-
-    if (!metadata) {
-      return ctx.reply(`❌ Token not found: ${text.substring(0, 12)}...`, createMainKeyboard());
-    }
-
-    const price = marketData?.price ? formatPrice(marketData.price) : "N/A";
-    
-    if (!user.autoBuy) {
-      return ctx.reply(`🔍 Token Detected: ${metadata.symbol}
-
-🏷️ Name: ${metadata.name}
-📍 Address: ${text.substring(0, 12)}...
-📈 Market: ${marketData?.market_type || "Unknown"}
-💰 Price: ${price} MON
-
-⚡ Auto-buy is OFF`, 
-        Markup.inlineKeyboard([
-          [Markup.button.callback(`⚡ Buy ${user.defaultBuyAmount} MON`, `quick_buy_${text}`)],
-          [Markup.button.callback("⚙️ Enable Auto-buy", "toggle_autobuy"), Markup.button.callback("« Back", "main_menu")]
-        ]));
-    }
-
-    if (!marketData) {
-      return ctx.reply(`❌ Token ${metadata.symbol} is not tradeable yet`, createMainKeyboard());
-    }
-
-    await executeAutoBuy(ctx, text, metadata, marketData, user);
-  }
-});
-
-// Quick buy from token detection
 bot.action(/^quick_buy_(.+)$/, requireAuth, async (ctx) => {
   const tokenAddress = ctx.match[1];
   const user = getWallet(ctx.from.id);
@@ -821,7 +1360,24 @@ bot.action(/^quick_buy_(.+)$/, requireAuth, async (ctx) => {
   await executeAutoBuy(ctx, tokenAddress, metadata, marketData, user);
 });
 
-// Additional action handlers
+bot.action(/^analyze_(.+)$/, requireAuth, async (ctx) => {
+  const tokenAddress = ctx.match[1];
+  await analyzeToken(ctx, tokenAddress);
+});
+
+bot.action(/^set_autosell_(.+)$/, requireAuth, (ctx) => {
+  const tokenAddress = ctx.match[1];
+  pendingActions.set(ctx.from.id, { type: 'set_autosell', tokenAddress });
+  ctx.editMessageText("🎯 Set Auto-sell for this token\n\nChoose trigger type:", 
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Market Cap", "autosell_mcap")],
+      [Markup.button.callback("💰 Profit %", "autosell_pnl")],
+      [Markup.button.callback("⏰ Time Hold", "autosell_time")],
+      [Markup.button.callback("« Back", "main_menu")]
+    ])
+  );
+});
+
 bot.action("balance", requireAuth, async (ctx) => {
   const user = getWallet(ctx.from.id);
   if (!user) return ctx.answerCbQuery("❌ No wallet found");
@@ -849,7 +1405,7 @@ bot.action("balance", requireAuth, async (ctx) => {
 bot.action("refresh", requireAuth, async (ctx) => {
   ctx.editMessageText("🔄 Refreshing data...");
   setTimeout(() => {
-    ctx.editMessageText("🚀 NAD Trading Bot", createMainKeyboard());
+    ctx.editMessageText("🚀 Enhanced NAD Trading Bot", createMainKeyboard());
   }, 1000);
 });
 
@@ -886,12 +1442,12 @@ bot.action("export", requireAuth, (ctx) => {
 
 bot.action("set_slippage", requireAuth, (ctx) => {
   ctx.editMessageText("🎯 Enter slippage tolerance (1-50):\n\nReply with just the number (e.g., 15)");
-  pendingSells.set(ctx.from.id, { type: 'slippage' });
+  pendingActions.set(ctx.from.id, { type: 'slippage' });
 });
 
 bot.action("set_default", requireAuth, (ctx) => {
   ctx.editMessageText("💰 Enter default buy amount in MON:\n\nReply with just the number (e.g., 0.5)");
-  pendingSells.set(ctx.from.id, { type: 'default_amount' });
+  pendingActions.set(ctx.from.id, { type: 'default_amount' });
 });
 
 bot.action("refresh_wallet", requireAuth, async (ctx) => {
@@ -900,9 +1456,9 @@ bot.action("refresh_wallet", requireAuth, async (ctx) => {
 
   const monBalance = await getMonBalance(user.address);
   
-  const message = `💤 Your Wallet
+  const message = `👤 Your Wallet
 
-🏦 Address: \`${user.address}\`
+🦀 Address: \`${user.address}\`
 💰 Balance: ${formatPrice(monBalance)} MON
 ⚡ Auto-buy: ${user.autoBuy ? "ON ✅" : "OFF ❌"}
 🎯 Slippage: ${user.slippage}%
@@ -956,7 +1512,60 @@ bot.action("cancel_buy", requireAuth, (ctx) => {
   ctx.editMessageText("❌ Buy cancelled", createMainKeyboard());
 });
 
-// Enhanced buy command with proper wallet usage
+bot.command("sell", requireAuth, async (ctx) => {
+  const args = ctx.message.text.split(" ");
+  if (args.length < 2) {
+    return ctx.reply("Usage: /sell <token_address_or_symbol> [amount_or_percentage]\n\nExamples:\n/sell 0x123...abc 50%\n/sell PEPE 1000000\n/sell baddog 25%");
+  }
+
+  const [cmd, tokenInput, amountInput] = args;
+  const user = getWallet(ctx.from.id);
+  if (!user) return ctx.reply("❌ No wallet found");
+
+  let targetPosition = null;
+  let positionIndex = -1;
+
+  if (ethers.isAddress(tokenInput)) {
+    positionIndex = user.positions.findIndex(p => p.ca.toLowerCase() === tokenInput.toLowerCase());
+    if (positionIndex !== -1) targetPosition = user.positions[positionIndex];
+  } else {
+    for (let i = 0; i < user.positions.length; i++) {
+      const pos = user.positions[i];
+      try {
+        const metadata = await getTokenMetadata(pos.ca);
+        if (metadata?.symbol?.toLowerCase() === tokenInput.toLowerCase()) {
+          targetPosition = pos;
+          positionIndex = i;
+          break;
+        }
+      } catch (error) {
+        continue;
+      }
+    }
+  }
+
+  if (!targetPosition) {
+    return ctx.reply("❌ Token not found in your positions");
+  }
+
+  if (!amountInput) {
+    const metadata = await getTokenMetadata(targetPosition.ca);
+    const message = `Select sell amount for ${metadata?.symbol || "token"}:`;
+    return ctx.reply(message, createSellPercentageKeyboard(positionIndex));
+  }
+
+  if (amountInput.endsWith('%')) {
+    const percentage = parseInt(amountInput.replace('%', ''));
+    if (percentage > 0 && percentage <= 100) {
+      await executeSell({ reply: (text, markup) => ctx.reply(text, markup), chat: ctx.chat, from: ctx.from }, positionIndex, percentage);
+    } else {
+      ctx.reply("❌ Invalid percentage. Use 1-100%");
+    }
+  } else {
+    ctx.reply("🚧 Specific amount selling will be implemented soon. Use percentages for now.");
+  }
+});
+
 bot.command("buy", requireAuth, async (ctx) => {
   const args = ctx.message.text.split(" ");
   if (args.length < 3 || !ethers.isAddress(args[1])) {
@@ -993,7 +1602,6 @@ bot.command("buy", requireAuth, async (ctx) => {
     let tx;
     
     if (marketData.market_type === "DEX") {
-      // FIXED: Use wallet for both read and write operations
       const dexRouterWithWallet = new ethers.Contract(CONTRACTS.DEX_ROUTER, dexRouterAbi, wallet);
       
       const estimatedAmountOut = await dexRouterWithWallet.getAmountOut(ca, amountIn, true);
@@ -1012,7 +1620,6 @@ bot.command("buy", requireAuth, async (ctx) => {
       const bondingCurveRead = new ethers.Contract(CONTRACTS.BONDING_CURVE_ROUTER, bondingCurveRouterAbi, provider);
       const amountOut = await bondingCurveRead.getAmountOut(ca, amountIn, true);
       const minOut = (amountOut * (100n - BigInt(user.slippage))) / 100n;
-
 
       const buyParams = {
         amountOutMin: minOut,
@@ -1063,11 +1670,14 @@ bot.command("buy", requireAuth, async (ctx) => {
 💵 Price: ${formatPrice(marketData.price)} MON
 🎯 Slippage: ${user.slippage}%
 📈 Market: ${marketData.market_type}
-🔗 Hash: ${tx.hash.substring(0, 20)}...`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback("📊 View Position", "positions")],
-        [Markup.button.callback("« Main Menu", "main_menu")]
-      ])
+🔗 Hash: ${createTxLink(tx.hash)}`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("📊 View Position", "positions")],
+          [Markup.button.callback("« Main Menu", "main_menu")]
+        ])
+      }
     );
 
   } catch (err) {
@@ -1086,14 +1696,13 @@ bot.command("buy", requireAuth, async (ctx) => {
   }
 });
 
-// Additional commands for better UX
 bot.command("help", requireAuth, (ctx) => {
-  ctx.reply(`🔋 NAD Bot Commands:
+  ctx.reply(`📋 NAD Bot Commands:
 
 🔐 Authentication:
 /auth <password> - Authenticate to use the bot
 
-💤 Quick Actions:
+👤 Quick Actions:
 /wallet - Wallet overview
 /positions - View your positions
 /buy <address> <amount> - Buy tokens
@@ -1113,9 +1722,9 @@ bot.command("wallet", requireAuth, async (ctx) => {
 
   const monBalance = await getMonBalance(user.address);
   
-  const message = `💤 Your Wallet
+  const message = `👤 Your Wallet
 
-🏦 Address: \`${user.address}\`
+🦀 Address: \`${user.address}\`
 💰 Balance: ${formatPrice(monBalance)} MON
 ⚡ Auto-buy: ${user.autoBuy ? "ON ✅" : "OFF ❌"}
 🎯 Slippage: ${user.slippage}%
@@ -1136,9 +1745,8 @@ bot.command("positions", requireAuth, async (ctx) => {
 
   let message = "📊 Your Positions:\n\n";
   const enrichedPositions = [];
-
-  // Clean up positions with zero balances first
   const validPositions = [];
+  
   for (let i = 0; i < user.positions.length; i++) {
     const pos = user.positions[i];
     try {
@@ -1168,11 +1776,11 @@ bot.command("positions", requireAuth, async (ctx) => {
           balance: tokenBalance,
           price,
           value,
-          index: validPositions.length, // Use validPositions length as index
+          index: validPositions.length,
           decimals
         };
         
-        validPositions.push(pos); // Keep original position for DB
+        validPositions.push(pos);
         enrichedPositions.push(positionInfo);
         
         message += `${enrichedPositions.length}. ${symbol}
@@ -1187,12 +1795,11 @@ bot.command("positions", requireAuth, async (ctx) => {
     }
   }
 
-  // Update user positions to only include valid ones
   user.positions = validPositions;
   dbSaveWallet(String(ctx.from.id), user);
 
   if (enrichedPositions.length === 0) {
-    message = "📭 No active positions\n\nAll token balances are zero.";
+    message = "🔭 No active positions\n\nAll token balances are zero.";
     return ctx.reply(message, 
       Markup.inlineKeyboard([[Markup.button.callback("« Back", "main_menu")]]));
   }
@@ -1212,7 +1819,6 @@ bot.catch((err, ctx) => {
   }
 });
 
-// Global error handlers
 process.on('unhandledRejection', (reason, promise) => {
   console.log('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -1221,6 +1827,7 @@ process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
 });
 
+// Bot startup function
 async function startBot() {
   try {
     console.log('🚀 Starting Enhanced NAD Bot...');
@@ -1234,7 +1841,8 @@ async function startBot() {
     
     await bot.launch();
     console.log('✅ Enhanced NAD Bot is running successfully!');
-    console.log('✨ Features: Fixed contract calls, proper error handling, enhanced UX');
+    console.log('✨ Features: Auto-sell, DCA, Token Analysis, Top Holders, Clickable TX Links');
+    console.log('⏱️ DCA & Auto-sell checks run every minute');
     
     process.once('SIGINT', () => {
       console.log('🛑 Received SIGINT, shutting down gracefully...');
